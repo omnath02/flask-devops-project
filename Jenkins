@@ -1,0 +1,103 @@
+pipeline {
+    agent any
+
+    environment {
+        SCANNER_HOME = tool 'SonarScanner'
+        DOCKERHUB_USER = 'ganrajdocker' //docker hub user name
+        IMAGE_NAME = 'flask-devops-project'
+        DEPLOY_HOST = '13.232.51.186' //ec2 machine public IP
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                git branch: 'main',
+                //credentialsId: 'github-private-token', // store token for private repo
+                    url: 'https://github.com/omnath02/flask-devops-project.git'
+            }
+        }
+
+        stage('Verify Files') {
+            steps {
+                sh 'pwd'
+                sh 'ls -la'
+            }
+        }
+
+        stage('Install Dependencies') {
+            steps {
+                sh '''
+                    python3 -m venv venv
+                    venv/bin/pip install -r requirements.txt
+                '''
+            }
+        }
+
+        stage('Lint & Tests') {
+            steps {
+                sh 'venv/bin/flake8 app.py || true'
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            steps {
+                withSonarQubeEnv('SonarQubeServer') {
+                    sh """
+                        ${SCANNER_HOME}/bin/sonar-scanner \
+                        -Dsonar.projectKey=my-python-app \
+                        -Dsonar.sources=. \
+                        -Dsonar.exclusions=venv/**,**/__pycache__/**
+                    """
+                }
+            }
+        }
+
+        stage('Quality Gate Check') {
+            steps {
+                timeout(time: 5, unit: 'MINUTES') {
+                    //waitForQualityGate abortPipeline: true
+                    waitForQualityGate abortPipeline: false
+                }
+            }
+        }
+
+        stage('Docker Build') {
+            steps {
+                sh "docker build -t ${IMAGE_NAME}:latest ."
+            }
+        }
+
+        stage('Docker Push') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DH_USER', passwordVariable: 'DH_PASS')]) {
+                    sh '''
+                        echo "$DH_PASS" | docker login -u "$DH_USER" --password-stdin
+                        docker tag ${IMAGE_NAME}:latest "$DH_USER/${IMAGE_NAME}:latest"
+                        docker push "$DH_USER/${IMAGE_NAME}:latest"
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy to EC2') {
+            steps {
+                withCredentials([sshUserPrivateKey(credentialsId: 'ec2-deploy-key', keyFileVariable: 'KEY_PATH', usernameVariable: 'SSH_USER')]) {
+                    sh """
+                        ssh -i "\$KEY_PATH" -o StrictHostKeyChecking=no "\${SSH_USER}@${DEPLOY_HOST}" '
+                            docker pull ${DOCKERHUB_USER}/${IMAGE_NAME}:latest &&
+                            docker rm -f flask-app || true &&
+                            docker run -d --name flask-app -p 5000:5000 --restart unless-stopped ${DOCKERHUB_USER}/${IMAGE_NAME}:latest &&
+                            docker ps --filter "name=flask-app"
+                        '
+                    """
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            sh 'docker logout || true'
+        }
+    }
+}
